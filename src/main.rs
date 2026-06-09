@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 breitburg
 
+mod api;
 mod app;
 mod autostart;
 mod blur;
 mod config;
 mod keybinding;
+mod markdown;
+mod screenshot;
 mod settings_window;
 mod spotlight;
 

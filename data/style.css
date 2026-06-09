@@ -28,12 +28,17 @@ window.spotlight .spotlight-card {
     /* The margin must exceed the shadow's reach (offset + blur) on every side,
      * or the toplevel clips it. Largest reach is 5 + 24 = 29px downward. */
     margin: 32px;
-    padding: 4px 10px;
-    border-radius: 9999px;
+    /* {corner_radius} is substituted from spotlight::CORNER_RADIUS at load
+     * time so the drawn card and the compositor blur clip share one value. */
+    border-radius: {corner_radius}px;
     background-color: alpha(@theme_base_color, 0.9);
     box-shadow:
         0 0 2px alpha(#000, 0.5),
         0 5px 24px alpha(#000, 0.2);
+}
+
+window.spotlight .entry-row {
+    padding: 4px 14px;
 }
 
 window.spotlight .spotlight-entry,
@@ -46,10 +51,11 @@ window.spotlight .spotlight-entry:focus {
     min-height: 40px;
 }
 
-/* Give the leading search icon more horizontal breathing room. */
-window.spotlight .spotlight-entry > image:first-child {
-    margin-left: 4px;
+/* Leading search icon: now a standalone widget at the entry-row's 14px inset,
+ * dimmed to match the trailing gear, with a 10px gap before the chip/text. */
+window.spotlight .search-icon {
     margin-right: 10px;
+    opacity: 0.55;
 }
 
 /* The settings button: dimmed to match the search icon, full colour on hover,
@@ -61,7 +67,9 @@ window.spotlight .spotlight-card button {
     border: none;
     min-height: 0;
     min-width: 0;
-    padding: 4px 4px 4px 10px;
+    /* 10px gap before the icon, flush to the entry-row's 14px inset on the
+     * right — mirrors the leading search icon. */
+    padding: 4px 0 4px 10px;
     opacity: 0.55;
 }
 
@@ -69,6 +77,63 @@ window.spotlight .spotlight-card button:hover {
     background: none;
     box-shadow: none;
     opacity: 1;
+}
+
+/* The chat area: assistant text sits plainly on the card surface (content,
+ * not chrome); only the user's own messages get a bubble, mirroring
+ * elementary Mail/Messages. */
+window.spotlight scrolledwindow,
+window.spotlight scrolledwindow > viewport {
+    background: transparent;
+}
+
+/* The message labels are selectable for copy/paste, but the blinking text
+ * caret reads as an editing affordance they don't have — hide it. */
+window.spotlight .user-message,
+window.spotlight .assistant-message {
+    caret-color: transparent;
+}
+
+window.spotlight .user-message {
+    opacity: 0.5;
+    padding: 2px 4px;
+}
+
+window.spotlight .assistant-message {
+    padding: 2px 4px;
+    /* Match the entry field's text size. */
+    font-size: 1.3em;
+}
+
+/* Hairline rule between the entry field and the conversation below it. */
+window.spotlight .field-separator {
+    background-color: alpha(@theme_fg_color, 0.12);
+    border: none;
+    min-height: 1px;
+}
+
+/* The thinking spinner sits where the reply text will, aligned to its inset. */
+window.spotlight .reply-spinner {
+    margin: 2px 4px;
+    min-width: 18px;
+    min-height: 18px;
+}
+
+window.spotlight .assistant-message.error {
+    color: @error_color;
+}
+
+/* Inline attachment chip at the trailing edge, just before the gear: a compact
+ * fully-rounded pill with a small gap before the settings button. */
+window.spotlight .attachment-chip {
+    background-color: alpha(@theme_fg_color, 0.08);
+    border-radius: 9999px;
+    padding: 2px 10px;
+    margin-right: 6px;
+}
+
+window.spotlight .attachment-chip image {
+    opacity: 0.7;
 }
 
 /* Settings: flat, backgroundless header that blends into the window. */

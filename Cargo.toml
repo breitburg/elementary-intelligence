@@ -13,8 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 gtk4 = { version = "0.9", features = ["v4_10"] }
+gdk-pixbuf = "0.20"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+async-channel = "2"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-scanner = "0.31"

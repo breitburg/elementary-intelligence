@@ -34,14 +34,14 @@ mod pantheon {
     wayland_scanner::generate_client_code!("protocol/pantheon-desktop-shell-v1.xml");
 }
 
+use pantheon::io_elementary_pantheon_extended_behavior_v1::IoElementaryPantheonExtendedBehaviorV1;
 use pantheon::io_elementary_pantheon_panel_v1::IoElementaryPantheonPanelV1;
 use pantheon::io_elementary_pantheon_shell_v1::IoElementaryPantheonShellV1;
 
-/// Inset of the card from the window edge — matches the CSS `margin`.
+/// Inset of the card from the window edge — matches the CSS `margin`. The
+/// compositor insets from the surface edges, so the region follows the window
+/// as it grows.
 const INSET: u32 = 32;
-/// Corner radius of the card. The card is a pill, so this is half its height
-/// (entry min-height 40 + 2×4 padding ≈ 48).
-const CLIP_RADIUS: u32 = 24;
 
 extern "C" {
     fn gdk_wayland_surface_get_wl_surface(
@@ -84,6 +84,9 @@ impl Dispatch<IoElementaryPantheonShellV1, ()> for State {
 impl Dispatch<IoElementaryPantheonPanelV1, ()> for State {
     fn event(_: &mut Self, _: &IoElementaryPantheonPanelV1, _: pantheon::io_elementary_pantheon_panel_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
+impl Dispatch<IoElementaryPantheonExtendedBehaviorV1, ()> for State {
+    fn event(_: &mut Self, _: &IoElementaryPantheonExtendedBehaviorV1, _: pantheon::io_elementary_pantheon_extended_behavior_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
 
 /// A connection to the compositor and the bound shell, set up once and reused.
 struct Context {
@@ -97,9 +100,35 @@ thread_local! {
     static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
 }
 
-/// Blur the desktop behind the card of `window`. No-op if the protocol is
+/// Blur the desktop behind the card of `window`, clipped to `radius` corners
+/// (the card's current CSS border-radius), and keep the surface centered as it
+/// resizes (so growing the chat expands the card symmetrically about the
+/// screen centre instead of downward only). No-op if the protocol is
 /// unavailable (e.g. running under a different compositor or X11).
-pub fn apply(window: &Window) {
+///
+/// Both effects must be wired in one place: `get_panel` may be called only
+/// once per `wl_surface`, so blur and centering share the single panel/surface
+/// pair set up here.
+pub fn apply(window: &Window, radius: u32) {
+    with_surface(window, |context, wl_surface| {
+        let panel = context.shell.get_panel(wl_surface, &context.qh, ());
+        panel.add_blur(INSET, INSET, INSET, INSET, radius);
+
+        // A centered surface is never granted keyboard focus automatically, so
+        // request it explicitly — otherwise the entry can't receive input.
+        let behavior = context
+            .shell
+            .get_extended_behavior(wl_surface, &context.qh, ());
+        behavior.make_centered();
+        behavior.focus();
+
+        let _ = context.conn.flush();
+    });
+}
+
+/// Resolve `window`'s Wayland surface, ensure the shell context is set up, and
+/// run `f` with the bound context and a proxy wrapping GTK's `wl_surface`.
+fn with_surface(window: &Window, f: impl FnOnce(&Context, &WlSurface)) {
     let Some(surface) = window.surface() else {
         return;
     };
@@ -139,9 +168,7 @@ pub fn apply(window: &Window) {
             return;
         };
 
-        let panel = context.shell.get_panel(&wl_surface, &context.qh, ());
-        panel.add_blur(INSET, INSET, INSET, INSET, CLIP_RADIUS);
-        let _ = context.conn.flush();
+        f(context, &wl_surface);
     });
 }
 

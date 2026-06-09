@@ -8,62 +8,73 @@ use serde::{Deserialize, Serialize};
 
 use crate::APP_ID;
 
-/// A single AI service the user can send messages to.
-///
-/// `url_template` contains a `{q}` placeholder that is replaced with the
-/// percent-encoded message before the link is opened.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Service {
-    pub name: String,
-    pub url_template: String,
-}
-
-impl Service {
-    fn new(name: &str, url_template: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            url_template: url_template.to_string(),
-        }
-    }
-
-    /// Build a launchable URL for `message` (already percent-encoded).
-    pub fn url_for(&self, encoded_message: &str) -> String {
-        self.url_template.replace("{q}", encoded_message)
-    }
-}
-
 fn default_true() -> bool {
     true
 }
 
+fn default_shortcut() -> String {
+    "<Control><Shift>space".to_string()
+}
+
+fn default_screenshot_shortcut() -> String {
+    "<Control><Shift>s".to_string()
+}
+
+fn default_api_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_system_prompt() -> String {
+    "You're a helpful assistant called El. You aim to respond in 1-2 sentences, \
+     straight to the point."
+        .to_string()
+}
+
+/// Every field carries a default so configs from older versions (which lack
+/// the API fields and may still contain the dropped `[[services]]` table)
+/// parse cleanly; unknown keys are ignored and the next save rewrites the
+/// file in the current shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
-    /// Whether the global shortcut is active.
+    /// Whether the global shortcuts are active.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Name of the currently selected [`Service`].
-    pub selected_service: String,
     /// GTK accelerator string, e.g. `<Control><Shift>space`.
+    #[serde(default = "default_shortcut")]
     pub shortcut: String,
+    /// Accelerator that opens the entry with a screenshot attached.
+    #[serde(default = "default_screenshot_shortcut")]
+    pub screenshot_shortcut: String,
     /// Whether to launch the background service on login.
+    #[serde(default = "default_true")]
     pub start_on_login: bool,
-    /// The configurable list of services.
-    pub services: Vec<Service>,
+    /// OpenAI-compatible API root, e.g. `https://api.openai.com/v1`.
+    #[serde(default = "default_api_base_url")]
+    pub api_base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// System prompt prepended to every conversation. Empty = none.
+    #[serde(default = "default_system_prompt")]
+    pub system_prompt: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            selected_service: "Claude".to_string(),
-            shortcut: "<Control><Shift>space".to_string(),
+            shortcut: default_shortcut(),
+            screenshot_shortcut: default_screenshot_shortcut(),
             start_on_login: true,
-            services: vec![
-                Service::new("Claude", "https://claude.ai/new?q={q}"),
-                Service::new("ChatGPT", "https://chatgpt.com/?q={q}"),
-                Service::new("Gemini", "https://gemini.google.com/app?q={q}"),
-                Service::new("Mistral", "https://chat.mistral.ai/chat?q={q}"),
-            ],
+            api_base_url: default_api_base_url(),
+            api_key: String::new(),
+            model: default_model(),
+            system_prompt: default_system_prompt(),
         }
     }
 }
@@ -106,17 +117,13 @@ impl Config {
             Ok(contents) => {
                 if let Err(err) = fs::write(&path, contents) {
                     eprintln!("Could not write {}: {err}", path.display());
+                    return;
                 }
+                // The file holds the API key; keep it private to the user.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
             }
             Err(err) => eprintln!("Could not serialize config: {err}"),
         }
-    }
-
-    /// The currently selected service, falling back to the first one.
-    pub fn current_service(&self) -> Option<&Service> {
-        self.services
-            .iter()
-            .find(|s| s.name == self.selected_service)
-            .or_else(|| self.services.first())
     }
 }

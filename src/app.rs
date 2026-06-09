@@ -15,6 +15,7 @@ use gtk4::{Application, CssProvider, Settings};
 
 use crate::config::Config;
 use crate::keybinding;
+use crate::screenshot;
 use crate::settings_window;
 use crate::spotlight;
 use crate::APP_ID;
@@ -40,9 +41,8 @@ pub fn build() -> Application {
             // Stay resident so the hotkey can reach us with no window open.
             std::mem::forget(app.hold());
 
-            // Make sure the system-wide shortcut reflects the saved state.
-            let config = config.borrow();
-            keybinding::apply(&config.shortcut, config.enabled);
+            // Make sure the system-wide shortcuts reflect the saved state.
+            keybinding::apply(&config.borrow());
 
             let quit = gio::SimpleAction::new("quit", None);
             quit.connect_activate(glib::clone!(
@@ -58,13 +58,15 @@ pub fn build() -> Application {
         #[strong]
         config,
         move |app, cmdline| {
-            let wants_spotlight = cmdline
-                .arguments()
-                .iter()
-                .any(|arg| arg.to_string_lossy() == "--spotlight");
+            let has_flag = |flag: &str| {
+                cmdline
+                    .arguments()
+                    .iter()
+                    .any(|arg| arg.to_string_lossy() == flag)
+            };
 
-            if wants_spotlight {
-                toggle_spotlight(app, &config);
+            if has_flag("--spotlight") {
+                toggle_spotlight(app, &config, has_flag("--screenshot"));
             } else if cmdline.is_remote() {
                 // The user launched the app again while it was already running
                 // (e.g. clicked the icon) — open settings. The initial
@@ -78,8 +80,13 @@ pub fn build() -> Application {
     app
 }
 
+thread_local! {
+    /// A present is scheduled but its settle delay hasn't elapsed yet.
+    static PRESENT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Show the entry, or dismiss it if it is already open (toggle).
-fn toggle_spotlight(app: &Application, config: &Rc<RefCell<Config>>) {
+fn toggle_spotlight(app: &Application, config: &Rc<RefCell<Config>>, with_screenshot: bool) {
     if !config.borrow().enabled {
         return;
     }
@@ -89,9 +96,33 @@ fn toggle_spotlight(app: &Application, config: &Rc<RefCell<Config>>) {
         .find(|w| w.widget_name() == "spotlight" && w.is_visible())
     {
         window.close();
-    } else {
-        spotlight::present(app, config);
+        return;
     }
+    if PRESENT_PENDING.with(|p| p.get()) {
+        return;
+    }
+    PRESENT_PENDING.with(|p| p.set(true));
+
+    // Capture strictly before the window exists so it isn't in the shot.
+    let shot = with_screenshot
+        .then(|| {
+            screenshot::capture()
+                .map_err(|err| eprintln!("Could not capture screenshot: {err}"))
+                .ok()
+        })
+        .flatten();
+
+    // Presenting in the same instant the hotkey fires gets the window's focus
+    // bounced by the compositor's keybinding handling, and the click-away
+    // close then dismisses it. A short settle delay sidesteps the bounce —
+    // the screenshot path always worked only because the blocking capture
+    // provided that delay implicitly.
+    let app = app.clone();
+    let config = config.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+        PRESENT_PENDING.with(|p| p.set(false));
+        spotlight::present(&app, &config, shot);
+    });
 }
 
 /// Follow the desktop light/dark preference, mirroring it exactly: dark only
@@ -129,8 +160,9 @@ fn apply_color_scheme(interface: &gio::Settings, settings: &Settings) {
 }
 
 fn load_css() {
+    let css = STYLE.replace("{corner_radius}", &spotlight::CORNER_RADIUS.to_string());
     let provider = CssProvider::new();
-    provider.load_from_data(STYLE);
+    provider.load_from_data(&css);
     if let Some(display) = Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,

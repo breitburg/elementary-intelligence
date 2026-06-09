@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 breitburg
 
-//! The persistent settings window: pick the service, the trigger shortcut and
-//! whether to launch on login.
+//! The persistent settings window: the API endpoint, key and model, the two
+//! trigger shortcuts and whether to launch on login.
 //!
 //! Laid out as a native elementary settings form — right-aligned labels in the
 //! left column, controls in the right column of a single grid.
@@ -16,13 +16,22 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, DropDown, EventControllerKey,
-    Grid, HeaderBar, Label, MenuButton, Orientation, Switch, Widget,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DropDown, Entry,
+    EventControllerKey, Grid, HeaderBar, Label, MenuButton, Orientation, PasswordEntry,
+    StringList, StringObject, Switch, Widget,
 };
 
+use crate::api;
 use crate::autostart;
 use crate::config::Config;
 use crate::keybinding;
+
+/// Which shortcut a capture button is currently recording for.
+#[derive(Clone, Copy, PartialEq)]
+enum ShortcutTarget {
+    Open,
+    Screenshot,
+}
 
 /// Show the settings window, creating it if it does not exist yet.
 pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
@@ -93,69 +102,228 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
         .margin_end(18)
         .build();
 
-    // --- Service -----------------------------------------------------------
-    let (service_names, selected_index): (Vec<String>, Option<usize>) = {
-        let config = config.borrow();
-        let names = config.services.iter().map(|s| s.name.clone()).collect();
-        let index = config
-            .services
-            .iter()
-            .position(|s| s.name == config.selected_service);
-        (names, index)
-    };
-    let name_refs: Vec<&str> = service_names.iter().map(String::as_str).collect();
-    let service_dropdown = DropDown::from_strings(&name_refs);
-    service_dropdown.set_hexpand(true);
-    if let Some(index) = selected_index {
-        service_dropdown.set_selected(index as u32);
+    // --- API endpoint, key and model ----------------------------------------
+    let url_entry = Entry::builder()
+        .text(&config.borrow().api_base_url)
+        .placeholder_text("https://api.openai.com/v1")
+        .hexpand(true)
+        .build();
+    add_row(&grid, 0, "API URL", &url_entry);
+
+    let key_entry = PasswordEntry::builder()
+        .show_peek_icon(true)
+        .hexpand(true)
+        .build();
+    key_entry.set_text(&config.borrow().api_key);
+    add_row(&grid, 1, "API Key", &key_entry);
+
+    // The model picker lists whatever the endpoint's /models reports. Until a
+    // fetch succeeds (or when it fails) it holds just the configured model.
+    let model_list = StringList::new(&[]);
+    if !config.borrow().model.is_empty() {
+        model_list.append(&config.borrow().model);
     }
-    add_row(&grid, 0, "Service", &service_dropdown);
+    let model_dropdown = DropDown::builder()
+        .model(&model_list)
+        .enable_search(true)
+        .hexpand(true)
+        .build();
+    // Search only filters if the dropdown knows how to turn each item into a
+    // string to match against — point it at the StringObject's `string`.
+    model_dropdown.set_expression(Some(gtk4::PropertyExpression::new(
+        StringObject::static_type(),
+        gtk4::Expression::NONE,
+        "string",
+    )));
+    add_row(&grid, 2, "Model", &model_dropdown);
+
+    // Repopulating the list fires selection notifications; ignore them.
+    let repopulating = Rc::new(Cell::new(false));
+    {
+        let config = config.clone();
+        let repopulating = repopulating.clone();
+        model_dropdown.connect_selected_item_notify(move |dropdown| {
+            if repopulating.get() {
+                return;
+            }
+            let Some(item) = dropdown.selected_item().and_downcast::<StringObject>() else {
+                return;
+            };
+            let mut config = config.borrow_mut();
+            config.model = item.string().to_string();
+            config.save();
+        });
+    }
+
+    let refresh_models = {
+        let config = config.clone();
+        let model_list = model_list.clone();
+        let model_dropdown = model_dropdown.clone();
+        let repopulating = repopulating.clone();
+        Rc::new(move || {
+            let (base_url, api_key, current) = {
+                let config = config.borrow();
+                (config.api_base_url.clone(), config.api_key.clone(), config.model.clone())
+            };
+            if base_url.is_empty() {
+                return;
+            }
+            let (sender, receiver) = async_channel::bounded::<Result<Vec<String>, String>>(1);
+            api::list_models(
+                api::ApiConfig { base_url, api_key, model: String::new() },
+                sender,
+            );
+            let model_list = model_list.clone();
+            let model_dropdown = model_dropdown.clone();
+            let repopulating = repopulating.clone();
+            glib::spawn_future_local(async move {
+                let Ok(Ok(mut models)) = receiver.recv().await else {
+                    return; // fetch failed: keep whatever the list holds
+                };
+                if models.is_empty() {
+                    return;
+                }
+                // The configured model stays available even if unlisted.
+                if !current.is_empty() && !models.contains(&current) {
+                    models.insert(0, current.clone());
+                }
+                repopulating.set(true);
+                model_list.splice(
+                    0,
+                    model_list.n_items(),
+                    &models.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+                if let Some(index) = models.iter().position(|m| *m == current) {
+                    model_dropdown.set_selected(index as u32);
+                }
+                repopulating.set(false);
+            });
+        })
+    };
+    refresh_models();
+
+    // Saving on every keystroke is fine for a TOML write, but refetching the
+    // model list is debounced until typing pauses.
+    let refetch_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let schedule_refresh = {
+        let refresh_models = refresh_models.clone();
+        let refetch_timer = refetch_timer.clone();
+        Rc::new(move || {
+            if let Some(source) = refetch_timer.borrow_mut().take() {
+                source.remove();
+            }
+            let refresh_models = refresh_models.clone();
+            let timer = refetch_timer.clone();
+            let source = glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                timer.borrow_mut().take();
+                refresh_models();
+            });
+            refetch_timer.borrow_mut().replace(source);
+        })
+    };
 
     {
         let config = config.clone();
-        service_dropdown.connect_selected_notify(move |dropdown| {
-            let index = dropdown.selected() as usize;
-            let mut config = config.borrow_mut();
-            if let Some(service) = config.services.get(index) {
-                config.selected_service = service.name.clone();
+        let schedule_refresh = schedule_refresh.clone();
+        url_entry.connect_changed(move |entry| {
+            {
+                let mut config = config.borrow_mut();
+                config.api_base_url = entry.text().trim().to_string();
                 config.save();
             }
+            schedule_refresh();
+        });
+    }
+    {
+        let config = config.clone();
+        let schedule_refresh = schedule_refresh.clone();
+        key_entry.connect_changed(move |entry| {
+            {
+                let mut config = config.borrow_mut();
+                config.api_key = entry.text().trim().to_string();
+                config.save();
+            }
+            schedule_refresh();
         });
     }
 
-    // --- Shortcut ----------------------------------------------------------
+    // --- System prompt ------------------------------------------------------
+    let system_view = gtk4::TextView::builder()
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(6)
+        .right_margin(6)
+        .build();
+    system_view.buffer().set_text(&config.borrow().system_prompt);
+    let system_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(72)
+        .max_content_height(160)
+        .has_frame(true)
+        .hexpand(true)
+        .child(&system_view)
+        .build();
+    system_scroll.add_css_class("system-prompt");
+    add_top_row(&grid, 3, "System prompt", &system_scroll);
+
+    {
+        let config = config.clone();
+        system_view.buffer().connect_changed(move |buffer| {
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, false);
+            let mut config = config.borrow_mut();
+            config.system_prompt = text.to_string();
+            config.save();
+        });
+    }
+
+    // --- Shortcuts -----------------------------------------------------------
     let shortcut_button = Button::with_label(&accel_to_label(&config.borrow().shortcut));
     shortcut_button.set_hexpand(true);
     shortcut_button.set_tooltip_text(Some("Click, then press the new combination"));
-    add_row(&grid, 1, "Shortcut", &shortcut_button);
+    add_row(&grid, 4, "Shortcut", &shortcut_button);
 
-    let capturing = Rc::new(Cell::new(false));
-    {
-        let capturing = capturing.clone();
-        let shortcut_button_inner = shortcut_button.clone();
-        shortcut_button.connect_clicked(move |button| {
-            capturing.set(true);
-            button.set_label("Press keys…");
-            shortcut_button_inner.add_css_class("suggested-action");
-        });
-    }
+    let screenshot_button =
+        Button::with_label(&accel_to_label(&config.borrow().screenshot_shortcut));
+    screenshot_button.set_hexpand(true);
+    screenshot_button.set_tooltip_text(Some(
+        "Opens the prompt with a screenshot of your screen attached",
+    ));
+    add_row(&grid, 5, "Screenshot shortcut", &screenshot_button);
+
+    // One shared capture state: only one button records at a time, and the
+    // single window-level key controller writes to whichever field is armed.
+    let capturing: Rc<Cell<Option<ShortcutTarget>>> = Rc::new(Cell::new(None));
+    arm_capture(&shortcut_button, &screenshot_button, &capturing, ShortcutTarget::Open, config);
+    arm_capture(&screenshot_button, &shortcut_button, &capturing, ShortcutTarget::Screenshot, config);
 
     let key_controller = EventControllerKey::new();
     {
         let capturing = capturing.clone();
         let config = config.clone();
         let shortcut_button = shortcut_button.clone();
+        let screenshot_button = screenshot_button.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
-            if !capturing.get() {
+            let Some(target) = capturing.get() else {
                 return glib::Propagation::Proceed;
-            }
+            };
+            let button = match target {
+                ShortcutTarget::Open => &shortcut_button,
+                ShortcutTarget::Screenshot => &screenshot_button,
+            };
+            let current = |config: &Config| match target {
+                ShortcutTarget::Open => config.shortcut.clone(),
+                ShortcutTarget::Screenshot => config.screenshot_shortcut.clone(),
+            };
             let reset = |button: &Button, label: &str| {
-                capturing.set(false);
+                capturing.set(None);
                 button.remove_css_class("suggested-action");
                 button.set_label(label);
             };
             if key == gdk::Key::Escape {
-                reset(&shortcut_button, &accel_to_label(&config.borrow().shortcut));
+                reset(button, &accel_to_label(&current(&config.borrow())));
                 return glib::Propagation::Stop;
             }
             if is_modifier_key(key) {
@@ -166,12 +334,15 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
                 return glib::Propagation::Stop;
             }
             let accel = gtk4::accelerator_name(key, mods).to_string();
-            reset(&shortcut_button, &accel_to_label(&accel));
+            reset(button, &accel_to_label(&accel));
 
             let mut config = config.borrow_mut();
-            config.shortcut = accel.clone();
+            match target {
+                ShortcutTarget::Open => config.shortcut = accel,
+                ShortcutTarget::Screenshot => config.screenshot_shortcut = accel,
+            }
             config.save();
-            keybinding::apply(&accel, config.enabled);
+            keybinding::apply(&config);
             glib::Propagation::Stop
         });
     }
@@ -183,7 +354,7 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
         .halign(Align::Start)
         .valign(Align::Center)
         .build();
-    add_row(&grid, 2, "Start on login", &login_switch);
+    add_row(&grid, 6, "Start on login", &login_switch);
 
     {
         let config = config.clone();
@@ -206,7 +377,7 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
             let mut config = config.borrow_mut();
             config.enabled = enabled;
             config.save();
-            keybinding::apply(&config.shortcut, enabled);
+            keybinding::apply(&config);
             grid.set_sensitive(enabled);
         });
     }
@@ -216,6 +387,36 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
     window.present();
 }
 
+/// Wire a shortcut button to arm capture for `target`, restoring the other
+/// button's label if it was mid-capture.
+fn arm_capture(
+    button: &Button,
+    other: &Button,
+    capturing: &Rc<Cell<Option<ShortcutTarget>>>,
+    target: ShortcutTarget,
+    config: &Rc<RefCell<Config>>,
+) {
+    let capturing = capturing.clone();
+    let other = other.clone();
+    let config = config.clone();
+    button.connect_clicked(move |button| {
+        if let Some(previous) = capturing.get() {
+            if previous != target {
+                let config = config.borrow();
+                let accel = match previous {
+                    ShortcutTarget::Open => &config.shortcut,
+                    ShortcutTarget::Screenshot => &config.screenshot_shortcut,
+                };
+                other.remove_css_class("suggested-action");
+                other.set_label(&accel_to_label(accel));
+            }
+        }
+        capturing.set(Some(target));
+        button.set_label("Press keys…");
+        button.add_css_class("suggested-action");
+    });
+}
+
 /// Attach a labelled control as one form row: right-aligned label in column 0,
 /// control in column 1.
 fn add_row(grid: &Grid, row: i32, label: &str, control: &impl IsA<Widget>) {
@@ -223,6 +424,19 @@ fn add_row(grid: &Grid, row: i32, label: &str, control: &impl IsA<Widget>) {
         .label(label)
         .halign(Align::End)
         .valign(Align::Center)
+        .build();
+    grid.attach(&label, 0, row, 1, 1);
+    grid.attach(control, 1, row, 1, 1);
+}
+
+/// Like `add_row`, but pins the label to the top of a tall control (e.g. the
+/// multi-line system-prompt box) instead of centring it.
+fn add_top_row(grid: &Grid, row: i32, label: &str, control: &impl IsA<Widget>) {
+    let label = Label::builder()
+        .label(label)
+        .halign(Align::End)
+        .valign(Align::Start)
+        .margin_top(6)
         .build();
     grid.attach(&label, 0, row, 1, 1);
     grid.attach(control, 1, row, 1, 1);
