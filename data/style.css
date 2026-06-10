@@ -31,10 +31,12 @@ window.spotlight .spotlight-card {
     /* {corner_radius} is substituted from spotlight::CORNER_RADIUS at load
      * time so the drawn card and the compositor blur clip share one value. */
     border-radius: {corner_radius}px;
-    background-color: alpha(@theme_base_color, 0.9);
+    background-color: alpha(@theme_base_color, 0.6);
     box-shadow:
-        0 0 2px alpha(#000, 0.5),
-        0 5px 24px alpha(#000, 0.2);
+        0 0 2px alpha(#000, 0.7),
+        0 5px 24px alpha(#000, 0.2),
+        /* Inner highlight: white, 0px blur, 1px down, 30% opacity. */
+        inset 0 1px 0 alpha(#fff, 0.3);
 }
 
 window.spotlight .entry-row {

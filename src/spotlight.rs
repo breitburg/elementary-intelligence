@@ -29,7 +29,7 @@ use crate::settings_window;
 /// clips the compositor blur region (below) and is substituted into the
 /// stylesheet's `border-radius` at load time (see `app::load_css`), so the
 /// frosted-glass blur and the drawn card always share the same corners.
-pub const CORNER_RADIUS: u32 = 12;
+pub const CORNER_RADIUS: u32 = 8;
 
 /// Fixed width of the card, in pixels. The window never changes width — only
 /// its height grows as the chat reveals — so the compositor keeps it centered
