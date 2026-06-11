@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="data/icons/128.svg" alt="Beckon icon" width="128" height="128">
+</p>
+
 # Beckon
 
 Summon any AI chat service from a system-wide shortcut.
