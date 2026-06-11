@@ -39,7 +39,7 @@ pub fn list_models(api: ApiConfig, sender: async_channel::Sender<Result<Vec<Stri
             .set("Authorization", &format!("Bearer {}", api.api_key))
             .call()
             .map_err(|err| match err {
-                ureq::Error::Status(code, _) => format!("HTTP {code}"),
+                ureq::Error::Status(code, response) => status_error_message(code, response),
                 err => err.to_string(),
             })
             .and_then(|response| {
@@ -62,6 +62,16 @@ pub fn list_models(api: ApiConfig, sender: async_channel::Sender<Result<Vec<Stri
     });
 }
 
+/// Best-effort `error.message` from an HTTP error response body, falling
+/// back to the bare status code.
+fn status_error_message(code: u16, response: ureq::Response) -> String {
+    let body = response.into_string().unwrap_or_default();
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("HTTP {code}"))
+}
+
 /// POST `{base_url}/responses` with `stream: true` on a worker thread,
 /// forwarding events to `sender`. Returns immediately.
 pub fn stream_chat(api: ApiConfig, messages: Vec<Value>, sender: async_channel::Sender<ChatEvent>) {
@@ -81,9 +91,11 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
         "store": false,
     });
 
-    // Connect timeout only: the response is an open-ended stream.
+    // No overall timeout (the response is an open-ended stream), but bound
+    // each read so a stalled server can't hang the worker thread forever.
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(120))
         .build();
     let response = agent
         .post(&url)
@@ -94,12 +106,7 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("HTTP {code}"));
-            return ChatEvent::Error(message);
+            return ChatEvent::Error(status_error_message(code, response));
         }
         Err(err) => return ChatEvent::Error(err.to_string()),
     };
@@ -132,10 +139,17 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
             }
             Some("response.completed") => return ChatEvent::Done,
             Some("response.failed") | Some("response.incomplete") => {
+                // Failed responses carry `error.message`; incomplete ones
+                // carry `incomplete_details.reason` (e.g. max_output_tokens).
                 let message = chunk["response"]["error"]["message"]
                     .as_str()
-                    .unwrap_or("The response did not complete")
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| {
+                        chunk["response"]["incomplete_details"]["reason"]
+                            .as_str()
+                            .map(|reason| format!("Response incomplete: {reason}"))
+                    })
+                    .unwrap_or_else(|| "The response did not complete".to_string());
                 return ChatEvent::Error(message);
             }
             Some("error") => {
@@ -145,5 +159,110 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
             _ => {}
         }
     }
-    ChatEvent::Done
+    // EOF without a terminal event: the connection was cut mid-response.
+    ChatEvent::Error("The stream ended unexpectedly".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve `body` as a close-delimited SSE response to one connection and
+    /// return the base URL to point the client at.
+    fn serve_once(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}")
+    }
+
+    /// Run a stream against `base_url` and return (concatenated deltas,
+    /// terminal event).
+    fn run_stream(base_url: String) -> (String, ChatEvent) {
+        let api = ApiConfig {
+            base_url,
+            api_key: String::new(),
+            model: "test".to_string(),
+        };
+        let (sender, receiver) = async_channel::unbounded();
+        let terminal = run(&api, &[], &sender);
+        drop(sender);
+        let mut deltas = String::new();
+        while let Ok(event) = receiver.recv_blocking() {
+            if let ChatEvent::Delta(delta) = event {
+                deltas.push_str(&delta);
+            }
+        }
+        (deltas, terminal)
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error() {
+        let url = serve_once(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        );
+        let (deltas, terminal) = run_stream(url);
+        assert_eq!(deltas, "partial");
+        match terminal {
+            ChatEvent::Error(message) => assert_eq!(message, "The stream ended unexpectedly"),
+            _ => panic!("expected an error for a truncated stream"),
+        }
+    }
+
+    #[test]
+    fn completed_stream_is_done() {
+        let url = serve_once(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+             data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let (deltas, terminal) = run_stream(url);
+        assert_eq!(deltas, "hi");
+        assert!(matches!(terminal, ChatEvent::Done));
+    }
+
+    #[test]
+    fn incomplete_response_reports_the_reason() {
+        let url = serve_once(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        let (_, terminal) = run_stream(url);
+        match terminal {
+            ChatEvent::Error(message) => {
+                assert_eq!(message, "Response incomplete: max_output_tokens")
+            }
+            _ => panic!("expected an error for an incomplete response"),
+        }
+    }
+
+    #[test]
+    fn http_error_surfaces_the_server_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = "{\"error\":{\"message\":\"Invalid API key\"}}";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let (_, terminal) = run_stream(format!("http://{addr}"));
+        match terminal {
+            ChatEvent::Error(message) => assert_eq!(message, "Invalid API key"),
+            _ => panic!("expected an error for an HTTP 401"),
+        }
+    }
 }

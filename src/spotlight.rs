@@ -440,11 +440,19 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                         ChatEvent::Error(message) => {
                             errored = true;
                             present_reply();
-                            reply_label.add_css_class("error");
-                            reply_label.set_markup(&format!(
-                                "<i>{}</i>",
-                                glib::markup_escape_text(&message)
-                            ));
+                            let error_line =
+                                format!("<i>{}</i>", glib::markup_escape_text(&message));
+                            if accumulated.is_empty() {
+                                reply_label.add_css_class("error");
+                                reply_label.set_markup(&error_line);
+                            } else {
+                                // Keep the partial answer visible; the error
+                                // class would tint all of it, so skip it here.
+                                reply_label.set_markup(&format!(
+                                    "{}\n\n{error_line}",
+                                    markdown::to_pango(&clean(&accumulated))
+                                ));
+                            }
                             break;
                         }
                     }
