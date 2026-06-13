@@ -422,17 +422,13 @@ fn is_date_only(params: &str, value: &str) -> bool {
 
 /// Zero-padded 14-digit key (YYYYMMDDHHMMSS) for chronological sorting.
 fn sort_key(start_raw: &Option<String>) -> String {
-    match start_raw {
-        Some(s) => {
-            let mut d: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-            d.truncate(14);
-            while d.len() < 14 {
-                d.push('0');
-            }
-            d
-        }
-        None => "0".repeat(14),
-    }
+    let digits: String = start_raw
+        .iter()
+        .flat_map(|s| s.chars())
+        .filter(|c| c.is_ascii_digit())
+        .take(14)
+        .collect();
+    format!("{digits:0<14}")
 }
 
 fn unescape(s: &str) -> String {
@@ -533,6 +529,17 @@ fn build_vevent(
     }
     v.push_str("END:VEVENT\r\n");
     Ok(v)
+}
+
+/// A `DTSTART`/`DTEND` property line from ISO input, emitting `;VALUE=DATE` for
+/// date-only values and a UTC timestamp otherwise.
+fn dt_property(name: &str, iso: &str) -> Result<String, String> {
+    let (secs, has_time) = parse_iso(iso)?;
+    Ok(if has_time {
+        format!("{name}:{}", epoch_to_make_time(secs))
+    } else {
+        format!("{name};VALUE=DATE:{}", epoch_to_date(secs))
+    })
 }
 
 /// Replace (or remove) all lines of property `name` in an unfolded VEVENT,
@@ -759,22 +766,10 @@ fn modify_event_tool() -> Tool {
                 set_property(&mut lines, "SUMMARY", Some(format!("SUMMARY:{}", escape(s))));
             }
             if let Some(s) = start {
-                let (secs, has_time) = parse_iso(s)?;
-                let line = if has_time {
-                    format!("DTSTART:{}", epoch_to_make_time(secs))
-                } else {
-                    format!("DTSTART;VALUE=DATE:{}", epoch_to_date(secs))
-                };
-                set_property(&mut lines, "DTSTART", Some(line));
+                set_property(&mut lines, "DTSTART", Some(dt_property("DTSTART", s)?));
             }
             if let Some(e) = end {
-                let (secs, has_time) = parse_iso(e)?;
-                let line = if has_time {
-                    format!("DTEND:{}", epoch_to_make_time(secs))
-                } else {
-                    format!("DTEND;VALUE=DATE:{}", epoch_to_date(secs))
-                };
-                set_property(&mut lines, "DTEND", Some(line));
+                set_property(&mut lines, "DTEND", Some(dt_property("DTEND", e)?));
             }
             if let Some(l) = location {
                 set_property(&mut lines, "LOCATION", Some(format!("LOCATION:{}", escape(l))));
