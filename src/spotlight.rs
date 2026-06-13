@@ -325,6 +325,66 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 .build();
             reply_label.add_css_class("assistant-message");
 
+            // Reasoning disclosure. Only attached to the tree if the stream
+            // carries a reasoning trace: a flat header toggles a revealer
+            // holding the dimmed, markdown-rendered thinking. It auto-expands
+            // while the model thinks, then collapses to a reopenable "Thought
+            // for Ns" line once the answer begins.
+            let reasoning_label = Label::builder()
+                .halign(Align::Fill)
+                .hexpand(true)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(WrapMode::WordChar)
+                .selectable(true)
+                .use_markup(true)
+                .build();
+            reasoning_label.add_css_class("reasoning-summary");
+
+            let reasoning_revealer = Revealer::builder()
+                .transition_type(RevealerTransitionType::SlideDown)
+                .transition_duration(200)
+                .reveal_child(true)
+                .child(&reasoning_label)
+                .build();
+
+            let reasoning_chevron = Image::from_icon_name("pan-down-symbolic");
+            let reasoning_title = Label::new(Some("Thinking…"));
+            let reasoning_header = GtkBox::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            reasoning_header.append(&reasoning_chevron);
+            reasoning_header.append(&reasoning_title);
+
+            let reasoning_toggle = Button::builder().child(&reasoning_header).build();
+            reasoning_toggle.add_css_class("flat");
+            reasoning_toggle.add_css_class("reasoning-toggle");
+            reasoning_toggle.set_halign(Align::Start);
+
+            let reasoning_box = GtkBox::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(2)
+                .build();
+            reasoning_box.add_css_class("reasoning");
+            reasoning_box.append(&reasoning_toggle);
+            reasoning_box.append(&reasoning_revealer);
+
+            // The header toggles the trace open or closed; the chevron tracks it.
+            {
+                let revealer = reasoning_revealer.clone();
+                let chevron = reasoning_chevron.clone();
+                reasoning_toggle.connect_clicked(move |_| {
+                    let open = !revealer.reveals_child();
+                    revealer.set_reveal_child(open);
+                    chevron.set_icon_name(Some(if open {
+                        "pan-down-symbolic"
+                    } else {
+                        "pan-end-symbolic"
+                    }));
+                });
+            }
+
             // A spinner stands in for the reply until the first token lands;
             // the reply label is only added to the tree once there's text, so
             // nothing but the spinner shows while waiting.
@@ -381,6 +441,49 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                         }
                     }
                 };
+                // When this turn started, used to label the collapsed trace.
+                let started = std::time::Instant::now();
+                let reasoning_collapsed = Rc::new(Cell::new(false));
+
+                // Reveal the reasoning trace above the answer the first time a
+                // reasoning chunk arrives (dropping the spinner). Idempotent.
+                let present_reasoning = {
+                    let messages = messages.clone();
+                    let reasoning_box = reasoning_box.clone();
+                    let remove_spinner = remove_spinner.clone();
+                    move || {
+                        remove_spinner();
+                        if reasoning_box.parent().is_none() {
+                            messages.append(&reasoning_box);
+                        }
+                    }
+                };
+
+                // Collapse the trace once the answer begins, relabelling the
+                // header with how long the model thought. Idempotent.
+                let collapse_reasoning = {
+                    let collapsed = reasoning_collapsed.clone();
+                    let revealer = reasoning_revealer.clone();
+                    let chevron = reasoning_chevron.clone();
+                    let title = reasoning_title.clone();
+                    let reasoning_box = reasoning_box.clone();
+                    move || {
+                        if collapsed.get() || reasoning_box.parent().is_none() {
+                            return;
+                        }
+                        collapsed.set(true);
+                        revealer.set_reveal_child(false);
+                        chevron.set_icon_name(Some("pan-end-symbolic"));
+                        let secs = started.elapsed().as_secs();
+                        title.set_label(&if secs == 0 {
+                            "Thought for a moment".to_string()
+                        } else {
+                            format!("Thought for {secs}s")
+                        });
+                    }
+                };
+
+                let mut reasoning_acc = String::new();
                 let fade = Rc::new(RefCell::new(FadeState::default()));
                 let finished = Rc::new(Cell::new(false));
                 let ticking = Rc::new(Cell::new(false));
@@ -429,7 +532,15 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 let mut errored = false;
                 while let Ok(event) = receiver.recv().await {
                     match event {
+                        ChatEvent::Reasoning(delta) => {
+                            reasoning_acc.push_str(&delta);
+                            present_reasoning();
+                            reasoning_label
+                                .set_markup(&markdown::to_pango(&clean(&reasoning_acc)));
+                        }
                         ChatEvent::Delta(delta) => {
+                            // The answer is starting: tuck the thinking away.
+                            collapse_reasoning();
                             accumulated.push_str(&delta);
                             present_reply();
                             fade.borrow_mut().push(delta, std::time::Instant::now());
@@ -461,6 +572,12 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 // just drop the spinner — no empty reply label is added.
                 finished.set(true);
                 remove_spinner();
+                // If the model only ever produced reasoning (no answer, or an
+                // error mid-thought), leave the trace open but relabel it so the
+                // header isn't stuck on "Thinking…".
+                if reasoning_box.parent().is_some() && !reasoning_collapsed.get() {
+                    reasoning_title.set_label("Reasoning");
+                }
                 if !errored && !accumulated.is_empty() {
                     // Snap to the final, fully opaque markdown render.
                     reply_label.set_markup(&markdown::to_pango(&clean(&accumulated)));
