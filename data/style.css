@@ -133,6 +133,27 @@ window.spotlight .assistant-message.error {
     color: @error_color;
 }
 
+/* Reasoning trace: a quiet, secondary disclosure above the answer. The header
+ * is a compact flat toggle (inheriting the dimmed-button styling, full opacity
+ * on hover); the summary reads as hushed, indented thinking set off by a rule.
+ * Scoped past the card's generic button padding with the `button` type. */
+window.spotlight button.reasoning-toggle {
+    padding: 2px 4px;
+    font-size: 0.85em;
+}
+
+window.spotlight .reasoning-toggle image {
+    -gtk-icon-size: 13px;
+    opacity: 0.7;
+}
+
+window.spotlight .reasoning-summary {
+    margin: 2px 4px 2px 7px;
+    padding-left: 12px;
+    border-left: 1px solid alpha(@theme_fg_color, 0.15);
+    opacity: 0.55;
+}
+
 /* Inline attachment chip at the trailing edge, just before the gear: a compact
  * fully-rounded pill with a small gap before the settings button. */
 window.spotlight .attachment-chip {

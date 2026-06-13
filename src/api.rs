@@ -14,7 +14,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 pub enum ChatEvent {
+    /// A chunk of the visible answer text.
     Delta(String),
+    /// A chunk of the model's reasoning, when the stream carries one. Whether a
+    /// trace appears is left to the model/endpoint; the client just renders it.
+    /// Display-only — never sent back as history.
+    Reasoning(String),
     Done,
     Error(String),
 }
@@ -111,6 +116,13 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
         Err(err) => return ChatEvent::Error(err.to_string()),
     };
 
+    // Forward an event to the UI; a failed send means the receiver was dropped
+    // (the window closed), so the caller should stop streaming.
+    let send = |event| sender.send_blocking(event).is_ok();
+    // Reasoning summaries arrive in one or more parts; once any reasoning has
+    // been forwarded, a fresh part is separated from the previous with a gap.
+    let mut reasoning_seen = false;
+
     let reader = BufReader::new(response.into_reader());
     for line in reader.lines() {
         let line = match line {
@@ -127,14 +139,30 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
             continue;
         };
         // Responses API events carry their type in the payload; only the text
-        // deltas, terminal states, and errors matter here.
+        // deltas, reasoning summaries, terminal states, and errors matter here.
         match chunk["type"].as_str() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = chunk["delta"].as_str() {
-                    if sender.send_blocking(ChatEvent::Delta(delta.to_string())).is_err() {
-                        // Receiver dropped: the window was closed, stop streaming.
+                    if !send(ChatEvent::Delta(delta.to_string())) {
                         return ChatEvent::Done;
                     }
+                }
+            }
+            // Summarised thinking (`reasoning.summary`) and, for models that
+            // expose it, the raw reasoning text — both shown as a trace.
+            Some("response.reasoning_summary_text.delta")
+            | Some("response.reasoning_text.delta") => {
+                if let Some(delta) = chunk["delta"].as_str() {
+                    reasoning_seen = true;
+                    if !send(ChatEvent::Reasoning(delta.to_string())) {
+                        return ChatEvent::Done;
+                    }
+                }
+            }
+            // A new summary part: separate it from the previous one with a gap.
+            Some("response.reasoning_summary_part.added") if reasoning_seen => {
+                if !send(ChatEvent::Reasoning("\n\n".to_string())) {
+                    return ChatEvent::Done;
                 }
             }
             Some("response.completed") => return ChatEvent::Done,
@@ -217,6 +245,34 @@ mod tests {
             ChatEvent::Error(message) => assert_eq!(message, "The stream ended unexpectedly"),
             _ => panic!("expected an error for a truncated stream"),
         }
+    }
+
+    #[test]
+    fn reasoning_deltas_are_forwarded_separately_from_the_answer() {
+        let url = serve_once(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+             data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let api = ApiConfig {
+            base_url: url,
+            api_key: String::new(),
+            model: "test".to_string(),
+        };
+        let (sender, receiver) = async_channel::unbounded();
+        let terminal = run(&api, &[], &sender);
+        drop(sender);
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        while let Ok(event) = receiver.recv_blocking() {
+            match event {
+                ChatEvent::Reasoning(delta) => reasoning.push_str(&delta),
+                ChatEvent::Delta(delta) => answer.push_str(&delta),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "think");
+        assert_eq!(answer, "hi");
+        assert!(matches!(terminal, ChatEvent::Done));
     }
 
     #[test]
