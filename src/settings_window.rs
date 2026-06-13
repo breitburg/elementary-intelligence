@@ -16,7 +16,7 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, DropDown, Entry,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry,
     EventControllerKey, Grid, HeaderBar, Label, MenuButton, Orientation, PasswordEntry,
     StringList, StringObject, Switch, Widget,
 };
@@ -25,6 +25,7 @@ use crate::api;
 use crate::autostart;
 use crate::config::Config;
 use crate::keybinding;
+use crate::tools;
 
 /// Which shortcut a capture button is currently recording for.
 #[derive(Clone, Copy, PartialEq)]
@@ -348,13 +349,42 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>) {
     }
     window.add_controller(key_controller);
 
+    // --- Tools --------------------------------------------------------------
+    // One checkbox per available tool; ticking adds its name to the enabled
+    // list the spotlight passes to the model.
+    let tools_box = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .build();
+    for info in tools::catalog() {
+        let check = CheckButton::builder()
+            .label(info.label)
+            .active(config.borrow().enabled_tools.iter().any(|t| t == info.name))
+            .tooltip_text(info.description)
+            .build();
+        {
+            let config = config.clone();
+            let name = info.name;
+            check.connect_toggled(move |check| {
+                let mut config = config.borrow_mut();
+                config.enabled_tools.retain(|t| t != name);
+                if check.is_active() {
+                    config.enabled_tools.push(name.to_string());
+                }
+                config.save();
+            });
+        }
+        tools_box.append(&check);
+    }
+    add_top_row(&grid, 6, "Tools", &tools_box);
+
     // --- Start on login ----------------------------------------------------
     let login_switch = Switch::builder()
         .active(config.borrow().start_on_login)
         .halign(Align::Start)
         .valign(Align::Center)
         .build();
-    add_row(&grid, 6, "Start on login", &login_switch);
+    add_row(&grid, 7, "Start on login", &login_switch);
 
     {
         let config = config.clone();

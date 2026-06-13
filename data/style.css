@@ -129,6 +129,12 @@ window.spotlight .reply-spinner {
     min-height: 18px;
 }
 
+/* Caption beside the spinner naming a running tool ("Running bash…"). */
+window.spotlight .tool-status {
+    color: alpha(@theme_fg_color, 0.6);
+    font-size: 0.9em;
+}
+
 window.spotlight .assistant-message.error {
     color: @error_color;
 }

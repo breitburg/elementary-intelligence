@@ -62,6 +62,10 @@ pub struct Config {
     /// System prompt prepended to every conversation. Empty = none.
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    /// Names of the tools the model may call, e.g. `["bash"]`. Empty disables
+    /// tool calling entirely. See `tools::catalog` for the available names.
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
 }
 
 impl Default for Config {
@@ -75,6 +79,7 @@ impl Default for Config {
             api_key: String::new(),
             model: default_model(),
             system_prompt: default_system_prompt(),
+            enabled_tools: Vec::new(),
         }
     }
 }

@@ -25,6 +25,7 @@ use crate::blur;
 use crate::config::Config;
 use crate::markdown;
 use crate::settings_window;
+use crate::tools;
 
 /// Corner radius of the card, in pixels. Single source of truth: it both
 /// clips the compositor blur region (below) and is substituted into the
@@ -443,11 +444,22 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
 
             // A spinner stands in for the reply until the first token lands;
             // the reply label is only added to the tree once there's text, so
-            // nothing but the spinner shows while waiting.
-            let spinner = gtk4::Spinner::builder().halign(Align::Start).build();
+            // nothing but the spinner shows while waiting. A caption beside it
+            // names a running tool ("Running bash…") and is hidden otherwise.
+            let spinner_row = GtkBox::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(8)
+                .halign(Align::Start)
+                .build();
+            let spinner = gtk4::Spinner::new();
             spinner.add_css_class("reply-spinner");
             spinner.start();
-            messages.append(&spinner);
+            spinner_row.append(&spinner);
+            let tool_label = Label::new(None);
+            tool_label.add_css_class("tool-status");
+            tool_label.set_visible(false);
+            spinner_row.append(&tool_label);
+            messages.append(&spinner_row);
 
             streaming.set(true);
             let (api_config, system_prompt) = {
@@ -467,20 +479,23 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 payload.push(json!({"role": "system", "content": system_prompt}));
             }
             payload.extend(history.borrow().iter().cloned());
+            // Hand the model only the tools the user enabled; an empty registry
+            // makes the request omit `tools` and behave exactly as before.
+            let registry = tools::registry_for(&config.borrow().enabled_tools);
             let (sender, receiver) = async_channel::unbounded::<ChatEvent>();
-            api::stream_chat(api_config, payload, sender);
+            api::stream_chat(api_config, payload, registry, sender);
 
             let history = history.clone();
             let streaming = streaming.clone();
             let messages = messages.clone();
             let handle = glib::spawn_future_local(async move {
-                // Remove the spinner if it's still attached.
+                // Remove the spinner row (spinner + tool caption) if attached.
                 let remove_spinner = {
                     let messages = messages.clone();
-                    let spinner = spinner.clone();
+                    let spinner_row = spinner_row.clone();
                     move || {
-                        if spinner.parent().is_some() {
-                            messages.remove(&spinner);
+                        if spinner_row.parent().is_some() {
+                            messages.remove(&spinner_row);
                         }
                     }
                 };
@@ -602,6 +617,23 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                             fade.borrow_mut().push(delta, std::time::Instant::now());
                             render();
                             start_ticker();
+                        }
+                        ChatEvent::ToolCall { name, item } => {
+                            // Persist the call so follow-up turns include it.
+                            history.borrow_mut().push(item);
+                            // Show progress: ensure the spinner row is visible
+                            // (an earlier turn's text may have removed it) and
+                            // caption it with the running tool.
+                            if spinner_row.parent().is_none() {
+                                messages.append(&spinner_row);
+                                spinner.start();
+                            }
+                            tool_label.set_text(&format!("Running {name}…"));
+                            tool_label.set_visible(true);
+                        }
+                        ChatEvent::ToolResult { item } => {
+                            // Persist the output right after its matching call.
+                            history.borrow_mut().push(item);
                         }
                         ChatEvent::Done => break,
                         ChatEvent::Error(message) => {

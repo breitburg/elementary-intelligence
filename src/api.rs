@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::tools::ToolRegistry;
+
 pub enum ChatEvent {
     /// A chunk of the visible answer text.
     Delta(String),
@@ -20,6 +22,13 @@ pub enum ChatEvent {
     /// trace appears is left to the model/endpoint; the client just renders it.
     /// Display-only — never sent back as history.
     Reasoning(String),
+    /// A tool is about to run. `name` captions the spinner; `item` is the full
+    /// `function_call` JSON that must be persisted into the conversation history
+    /// (the UI mirrors it into its `history` so follow-up turns include it).
+    ToolCall { name: String, item: Value },
+    /// A tool finished. `item` is the `function_call_output` JSON to persist
+    /// right after its matching call.
+    ToolResult { item: Value },
     Done,
     Error(String),
 }
@@ -79,22 +88,116 @@ fn status_error_message(code: u16, response: ureq::Response) -> String {
 
 /// POST `{base_url}/responses` with `stream: true` on a worker thread,
 /// forwarding events to `sender`. Returns immediately.
-pub fn stream_chat(api: ApiConfig, messages: Vec<Value>, sender: async_channel::Sender<ChatEvent>) {
+///
+/// When `tools` is non-empty the request advertises them and this runs a
+/// multi-turn agent loop: the model's `function_call`s are executed here and
+/// their outputs fed back, repeating until the model produces a final answer.
+pub fn stream_chat(
+    api: ApiConfig,
+    messages: Vec<Value>,
+    tools: ToolRegistry,
+    sender: async_channel::Sender<ChatEvent>,
+) {
     std::thread::spawn(move || {
-        let event = run(&api, &messages, &sender);
+        let event = run(&api, messages, &tools, &sender);
         let _ = sender.send_blocking(event);
     });
 }
 
-fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatEvent>) -> ChatEvent {
+/// Cap on agent-loop iterations so a model that keeps calling tools without
+/// ever answering can't spin the worker thread forever.
+const MAX_TURNS: usize = 8;
+
+/// Drive the conversation to a final answer, owning the growing `input` vec.
+/// Each iteration runs one model turn; if it asked for tools, they are executed
+/// and their results appended before the next turn.
+fn run(
+    api: &ApiConfig,
+    mut input: Vec<Value>,
+    tools: &ToolRegistry,
+    sender: &async_channel::Sender<ChatEvent>,
+) -> ChatEvent {
+    for _turn in 0..MAX_TURNS {
+        let calls = match run_turn(api, &input, tools, sender) {
+            Ok(TurnOutcome::Completed) => return ChatEvent::Done,
+            Ok(TurnOutcome::ToolCalls(calls)) => calls,
+            Err(event) => return event,
+        };
+
+        for call in calls {
+            let name = call["name"].as_str().unwrap_or_default().to_string();
+            let call_id = call["call_id"].as_str().unwrap_or_default().to_string();
+            // `arguments` is a JSON-encoded string; pass it through verbatim.
+            let args_str = call["arguments"].as_str().unwrap_or("{}").to_string();
+
+            let call_item = json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": args_str,
+            });
+            if sender
+                .send_blocking(ChatEvent::ToolCall { name: name.clone(), item: call_item.clone() })
+                .is_err()
+            {
+                return ChatEvent::Done; // receiver dropped: window closed
+            }
+            input.push(call_item);
+
+            // Malformed arguments are reported back to the model as the output
+            // so it can retry, rather than aborting the loop.
+            let parsed = serde_json::from_str::<Value>(&args_str).unwrap_or_else(|_| json!({}));
+            let output = match tools.dispatch(&name, parsed) {
+                Ok(out) => out,
+                Err(err) => format!("error: {err}"),
+            };
+
+            let output_item = json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            });
+            if sender
+                .send_blocking(ChatEvent::ToolResult { item: output_item.clone() })
+                .is_err()
+            {
+                return ChatEvent::Done;
+            }
+            input.push(output_item);
+        }
+    }
+    ChatEvent::Error("The assistant kept calling tools without finishing".to_string())
+}
+
+/// The result of a single model turn.
+enum TurnOutcome {
+    /// The model produced only text: this is the final answer.
+    Completed,
+    /// The model emitted one or more `function_call` items to execute.
+    ToolCalls(Vec<Value>),
+}
+
+/// Run one model turn: POST `/responses`, stream text deltas as they arrive,
+/// and collect any `function_call` items the model emits. Terminal failures
+/// (HTTP errors, a dropped receiver, a truncated stream) are returned as
+/// `Err(ChatEvent::…)` for the caller to forward.
+fn run_turn(
+    api: &ApiConfig,
+    input: &[Value],
+    tools: &ToolRegistry,
+    sender: &async_channel::Sender<ChatEvent>,
+) -> Result<TurnOutcome, ChatEvent> {
     let url = format!("{}/responses", api.base_url.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "model": api.model,
         "stream": true,
-        "input": messages,
+        "input": input,
         // The conversation is resent in full each turn; no server-side state.
         "store": false,
     });
+    if let Some(definitions) = tools.definitions() {
+        body["tools"] = definitions;
+    }
 
     // No overall timeout (the response is an open-ended stream), but bound
     // each read so a stalled server can't hang the worker thread forever.
@@ -111,9 +214,9 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
-            return ChatEvent::Error(status_error_message(code, response));
+            return Err(ChatEvent::Error(status_error_message(code, response)));
         }
-        Err(err) => return ChatEvent::Error(err.to_string()),
+        Err(err) => return Err(ChatEvent::Error(err.to_string())),
     };
 
     // Forward an event to the UI; a failed send means the receiver was dropped
@@ -124,27 +227,31 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
     let mut reasoning_seen = false;
 
     let reader = BufReader::new(response.into_reader());
+    let mut calls: Vec<Value> = Vec::new();
     for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
-            Err(err) => return ChatEvent::Error(format!("Stream interrupted: {err}")),
+            Err(err) => return Err(ChatEvent::Error(format!("Stream interrupted: {err}"))),
         };
         let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
             continue;
         };
         if data == "[DONE]" {
-            return ChatEvent::Done;
+            // Some endpoints close with a bare [DONE]; treat it as turn end.
+            return Ok(turn_outcome(calls));
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
         // Responses API events carry their type in the payload; only the text
-        // deltas, reasoning summaries, terminal states, and errors matter here.
+        // deltas, reasoning summaries, tool calls, terminal states, and errors
+        // matter here.
         match chunk["type"].as_str() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = chunk["delta"].as_str() {
                     if !send(ChatEvent::Delta(delta.to_string())) {
-                        return ChatEvent::Done;
+                        // Receiver dropped: the window was closed, stop streaming.
+                        return Err(ChatEvent::Done);
                     }
                 }
             }
@@ -155,17 +262,25 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
                 if let Some(delta) = chunk["delta"].as_str() {
                     reasoning_seen = true;
                     if !send(ChatEvent::Reasoning(delta.to_string())) {
-                        return ChatEvent::Done;
+                        return Err(ChatEvent::Done);
                     }
                 }
             }
             // A new summary part: separate it from the previous one with a gap.
             Some("response.reasoning_summary_part.added") if reasoning_seen => {
                 if !send(ChatEvent::Reasoning("\n\n".to_string())) {
-                    return ChatEvent::Done;
+                    return Err(ChatEvent::Done);
                 }
             }
-            Some("response.completed") => return ChatEvent::Done,
+            // A fully-formed output item: harvest function calls here, where the
+            // item carries name, call_id and the complete arguments string in
+            // one place (the most provider-portable harvest point).
+            Some("response.output_item.done") => {
+                if chunk["item"]["type"] == "function_call" {
+                    calls.push(chunk["item"].clone());
+                }
+            }
+            Some("response.completed") => return Ok(turn_outcome(calls)),
             Some("response.failed") | Some("response.incomplete") => {
                 // Failed responses carry `error.message`; incomplete ones
                 // carry `incomplete_details.reason` (e.g. max_output_tokens).
@@ -178,17 +293,26 @@ fn run(api: &ApiConfig, messages: &[Value], sender: &async_channel::Sender<ChatE
                             .map(|reason| format!("Response incomplete: {reason}"))
                     })
                     .unwrap_or_else(|| "The response did not complete".to_string());
-                return ChatEvent::Error(message);
+                return Err(ChatEvent::Error(message));
             }
             Some("error") => {
                 let message = chunk["message"].as_str().unwrap_or("Stream error").to_string();
-                return ChatEvent::Error(message);
+                return Err(ChatEvent::Error(message));
             }
             _ => {}
         }
     }
     // EOF without a terminal event: the connection was cut mid-response.
-    ChatEvent::Error("The stream ended unexpectedly".to_string())
+    Err(ChatEvent::Error("The stream ended unexpectedly".to_string()))
+}
+
+/// A turn with no collected calls is the final answer; otherwise its calls run.
+fn turn_outcome(calls: Vec<Value>) -> TurnOutcome {
+    if calls.is_empty() {
+        TurnOutcome::Completed
+    } else {
+        TurnOutcome::ToolCalls(calls)
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +338,63 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Serve `bodies` as close-delimited SSE responses, one per incoming
+    /// connection (so a multi-turn agent loop sees a fresh response each turn),
+    /// and return the base URL.
+    fn serve_each(bodies: Vec<&'static str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn tool_call_runs_and_continues_the_conversation() {
+        // Turn 1 asks to run a tool; turn 2 (after the result is fed back) gives
+        // the final answer.
+        let url = serve_each(vec![
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n\
+             data: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"all done\"}\n\n\
+             data: {\"type\":\"response.completed\"}\n\n",
+        ]);
+        let api = ApiConfig {
+            base_url: url,
+            api_key: String::new(),
+            model: "test".to_string(),
+        };
+        let tools = crate::tools::registry_for(&["bash".to_string()]);
+        let (sender, receiver) = async_channel::unbounded();
+        let terminal = run(&api, Vec::new(), &tools, &sender);
+        drop(sender);
+
+        let mut deltas = String::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_results = 0;
+        while let Ok(event) = receiver.recv_blocking() {
+            match event {
+                ChatEvent::Delta(delta) => deltas.push_str(&delta),
+                ChatEvent::ToolCall { name, .. } => tool_calls.push(name),
+                ChatEvent::ToolResult { .. } => tool_results += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(tool_calls, vec!["bash".to_string()]);
+        assert_eq!(tool_results, 1);
+        assert_eq!(deltas, "all done");
+        assert!(matches!(terminal, ChatEvent::Done));
+    }
+
     /// Run a stream against `base_url` and return (concatenated deltas,
     /// terminal event).
     fn run_stream(base_url: String) -> (String, ChatEvent) {
@@ -223,7 +404,7 @@ mod tests {
             model: "test".to_string(),
         };
         let (sender, receiver) = async_channel::unbounded();
-        let terminal = run(&api, &[], &sender);
+        let terminal = run(&api, Vec::new(), &ToolRegistry::new(), &sender);
         drop(sender);
         let mut deltas = String::new();
         while let Ok(event) = receiver.recv_blocking() {
@@ -260,7 +441,7 @@ mod tests {
             model: "test".to_string(),
         };
         let (sender, receiver) = async_channel::unbounded();
-        let terminal = run(&api, &[], &sender);
+        let terminal = run(&api, Vec::new(), &ToolRegistry::new(), &sender);
         drop(sender);
         let (mut reasoning, mut answer) = (String::new(), String::new());
         while let Ok(event) = receiver.recv_blocking() {

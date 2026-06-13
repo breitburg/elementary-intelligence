@@ -11,6 +11,7 @@ mod markdown;
 mod screenshot;
 mod settings_window;
 mod spotlight;
+mod tools;
 
 use gtk4::prelude::*;
 
