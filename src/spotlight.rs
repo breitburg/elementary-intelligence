@@ -13,8 +13,9 @@ use gtk4::glib;
 use gtk4::pango::WrapMode;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, Box as GtkBox, Button, Entry, EventControllerKey, Image, Label,
-    Orientation, PolicyType, Revealer, RevealerTransitionType, ScrolledWindow, Separator, Window,
+    Align, Application, Box as GtkBox, Button, ContentFit, Entry, EventControllerKey, Image, Label,
+    Orientation, Picture, PolicyType, Revealer, RevealerTransitionType, ScrolledWindow, Separator,
+    Window,
 };
 
 use serde_json::{json, Value};
@@ -45,6 +46,34 @@ fn clean(text: &str) -> String {
         text = text.replace("\n\n\n", "\n\n");
     }
     text
+}
+
+/// Longest edge, in pixels, of an attached image as shown inline in the chat.
+/// The full-resolution data URL still rides along to the model; only the
+/// on-screen thumbnail is bounded.
+const ATTACHMENT_MAX_EDGE: f64 = 220.0;
+
+/// Decode a `data:…;base64,…` URL into a GPU texture, or `None` if it isn't a
+/// base64 data URL or the bytes don't parse as an image. Used to render the
+/// images carried in a message's content parts back into the chat.
+fn texture_from_data_url(data_url: &str) -> Option<gdk::Texture> {
+    let base64 = data_url.split_once(";base64,").map(|(_, data)| data)?;
+    let bytes = glib::Bytes::from_owned(glib::base64_decode(base64));
+    gdk::Texture::from_bytes(&bytes).ok()
+}
+
+/// A bounded, left-aligned thumbnail for an inline image attachment. The aspect
+/// ratio is preserved and the longest edge is capped at `ATTACHMENT_MAX_EDGE`.
+fn attachment_thumbnail(texture: &gdk::Texture) -> Picture {
+    let picture = Picture::for_paintable(texture);
+    picture.set_halign(Align::Start);
+    picture.set_content_fit(ContentFit::Contain);
+    picture.set_can_shrink(true);
+    let (width, height) = (texture.width() as f64, texture.height() as f64);
+    let scale = (ATTACHMENT_MAX_EDGE / width.max(height)).min(1.0);
+    picture.set_size_request((width * scale).round() as i32, (height * scale).round() as i32);
+    picture.add_css_class("user-attachment");
+    picture
 }
 
 /// Duration over which a freshly arrived chunk fades from faint to opaque.
@@ -212,8 +241,9 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
     let active_stream: Rc<RefCell<Option<glib::JoinHandle<()>>>> = Rc::new(RefCell::new(None));
     // The first user message is hidden while the chat is a single exchange; it
     // is revealed once a second turn arrives and the history becomes worth
-    // scrolling back through.
-    let first_user_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
+    // scrolling back through. Holds the whole message row (text plus any
+    // attachment thumbnails), so the image hides and reveals with the text.
+    let first_user_message: Rc<RefCell<Option<GtkBox>>> = Rc::new(RefCell::new(None));
 
     // Stick to the bottom while the reply streams in, but let the user scroll
     // up and stay there. The label only resizes after `set_markup` returns, so
@@ -254,7 +284,7 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
         let history = history.clone();
         let streaming = streaming.clone();
         let screenshot = screenshot.clone();
-        let first_user_label = first_user_label.clone();
+        let first_user_message = first_user_message.clone();
         let active_stream = active_stream.clone();
         entry.connect_activate(move |entry| {
             let text = entry.text();
@@ -263,17 +293,25 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 return;
             }
 
-            // The screenshot rides along on the first message only, as a
-            // Responses API content-part array.
-            let content = match screenshot.borrow_mut().take() {
-                Some(data_url) => {
-                    chip.set_visible(false);
-                    json!([
-                        {"type": "input_text", "text": message},
-                        {"type": "input_image", "image_url": data_url},
-                    ])
+            // Any attachments pending in the field ride along on this message
+            // as Responses API content parts; the field's chip clears once
+            // they've been consumed. Currently sourced from a screenshot, but
+            // the rendering below treats them generically.
+            let attachments: Vec<String> = screenshot.borrow_mut().take().into_iter().collect();
+            if !attachments.is_empty() {
+                chip.set_visible(false);
+            }
+
+            // A plain string for text-only turns; a content-part array once
+            // there's at least one image to carry alongside the text.
+            let content = if attachments.is_empty() {
+                json!(message)
+            } else {
+                let mut parts = vec![json!({"type": "input_text", "text": message})];
+                for data_url in &attachments {
+                    parts.push(json!({"type": "input_image", "image_url": data_url}));
                 }
-                None => json!(message),
+                Value::Array(parts)
             };
             let is_first_turn = history.borrow().is_empty();
             history.borrow_mut().push(json!({"role": "user", "content": content}));
@@ -281,6 +319,18 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
             // Past the first turn, the field invites a follow-up.
             entry.set_placeholder_text(Some("Follow up…"));
 
+            // The user's turn is a column: attachment thumbnails stacked above
+            // the text, so an image shows in the chat the same way it was sent.
+            let user_message = GtkBox::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(8)
+                .halign(Align::Start)
+                .build();
+            for data_url in &attachments {
+                if let Some(texture) = texture_from_data_url(data_url) {
+                    user_message.append(&attachment_thumbnail(&texture));
+                }
+            }
             let user_label = Label::builder()
                 .label(&message)
                 .halign(Align::Start)
@@ -291,20 +341,26 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
                 .selectable(true)
                 .build();
             user_label.add_css_class("user-message");
+            user_message.append(&user_label);
             if is_first_turn {
-                // Keep this first message hidden until a follow-up arrives.
-                user_label.set_visible(false);
-                *first_user_label.borrow_mut() = Some(user_label.clone());
+                // A plain opening turn stays hidden until a follow-up arrives, so
+                // a single exchange shows just the answer. A turn carrying an
+                // attachment is always shown — the user added the image to see it
+                // land in the chat.
+                if attachments.is_empty() {
+                    user_message.set_visible(false);
+                    *first_user_message.borrow_mut() = Some(user_message.clone());
+                }
             } else {
                 // Extra breathing room above each follow-up question, setting it
                 // apart from the previous reply.
-                user_label.set_margin_top(12);
-                if let Some(first) = first_user_label.borrow_mut().take() {
+                user_message.set_margin_top(12);
+                if let Some(first) = first_user_message.borrow_mut().take() {
                     // Second turn: the conversation now has history worth showing.
                     first.set_visible(true);
                 }
             }
-            messages.append(&user_label);
+            messages.append(&user_message);
 
             // First send: reveal the chat below the entry. The blur region
             // from map is kept as-is — Gala forbids a second get_panel on the
@@ -483,7 +539,7 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
         let messages = messages.clone();
         let revealer = revealer.clone();
         let entry_for_key = entry.clone();
-        let first_user_label = first_user_label.clone();
+        let first_user_message = first_user_message.clone();
         let streaming = streaming.clone();
         let active_stream = active_stream.clone();
         key_controller.connect_key_pressed(move |_, key, _, _| {
@@ -502,7 +558,7 @@ pub fn present(app: &Application, config: &Rc<RefCell<Config>>, screenshot: Opti
             }
             streaming.set(false);
             history.borrow_mut().clear();
-            first_user_label.borrow_mut().take();
+            first_user_message.borrow_mut().take();
             while let Some(child) = messages.first_child() {
                 messages.remove(&child);
             }

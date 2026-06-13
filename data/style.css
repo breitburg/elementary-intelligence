@@ -101,6 +101,14 @@ window.spotlight .user-message {
     padding: 2px 4px;
 }
 
+/* Inline image attachment shown in a user's turn: a framed thumbnail with a
+ * hairline border, indented to align with the message text's 4px inset. */
+window.spotlight .user-attachment {
+    margin: 0 4px;
+    border-radius: 6px;
+    border: 1px solid alpha(@theme_fg_color, 0.12);
+}
+
 window.spotlight .assistant-message {
     padding: 2px 4px;
     /* Match the entry field's text size. */
